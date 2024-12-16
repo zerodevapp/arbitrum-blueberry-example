@@ -1,17 +1,22 @@
 import React, { useEffect, useState } from "react";
 
 import { useWallets, usePrivy } from "@privy-io/react-auth";
-import { createKernelAccount, createKernelAccountClient } from "@zerodev/sdk";
+import { addressToEmptyAccount, createKernelAccount, createKernelAccountClient, createZeroDevPaymasterClient } from "@zerodev/sdk";
 import { signerToEcdsaValidator } from "@zerodev/ecdsa-validator";
-import { http, createPublicClient, Address, zeroAddress } from "viem";
-import { KERNEL_V2_4 } from "@zerodev/sdk/constants";
+import { http, createPublicClient, zeroAddress } from "viem";
+import { getEntryPoint, KERNEL_V3_1 } from "@zerodev/sdk/constants";
+import { b3 } from 'viem/chains';
+import { deserializePermissionAccount, serializePermissionAccount, toPermissionValidator } from "@zerodev/permissions";
+import { toECDSASigner } from "@zerodev/permissions/signers";
 import {
-  entryPoint06Address,
-  EntryPointVersion,
-} from "viem/account-abstraction";
-import { arbitrumBlueberry } from "../constants";
+  toSudoPolicy,
+} from "@zerodev/permissions/policies";
+import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 
 type KernelClientType = Awaited<ReturnType<typeof createKernelAccountClient>>;
+
+const bundlerRpcUrl = 'bundlerRpcUrl'
+const paymasterRpcUrl = 'paymasterRpcUrl'
 
 function App() {
   const [kernelClient, setKernelClient] = useState<
@@ -29,16 +34,13 @@ function App() {
       const privyProvider = await embeddedWallet.getEthereumProvider();
 
       const publicClient = createPublicClient({
-        transport: http("https://rpc.arb-blueberry.gelato.digital"),
-        chain: arbitrumBlueberry,
+        transport: http("https://mainnet-rpc.b3.fun"),
+        chain: b3,
       });
 
-      const entryPoint = {
-        address: entryPoint06Address as Address,
-        version: "0.6" as EntryPointVersion,
-      };
+      const entryPoint = getEntryPoint("0.7")
 
-      const kernelVersion = KERNEL_V2_4;
+      const kernelVersion = KERNEL_V3_1;
       const ecdsaValidator = await signerToEcdsaValidator(publicClient, {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         signer: privyProvider as any,
@@ -46,19 +48,57 @@ function App() {
         kernelVersion,
       });
 
+      const sessionKeySigner = await toECDSASigner({
+        signer: privateKeyToAccount(generatePrivateKey()),
+      });
+    
+      const emptyAccount = addressToEmptyAccount(sessionKeySigner.account.address)
+    
+      const emptySessionKeySigner = await toECDSASigner({ signer: emptyAccount })
+    
+      const permissionPlugin = await toPermissionValidator(publicClient, {
+        entryPoint,
+        signer: emptySessionKeySigner,
+        policies: [
+          toSudoPolicy({}),
+        ],
+        kernelVersion: KERNEL_V3_1,
+      });
+
       const account = await createKernelAccount(publicClient, {
         plugins: {
           sudo: ecdsaValidator,
+          regular: permissionPlugin
         },
         entryPoint,
         kernelVersion,
       });
       console.log("My account:", account.address);
 
+      const approval = await serializePermissionAccount(account)
+
+      const paymasterClient = createZeroDevPaymasterClient({
+        chain: b3,
+        transport: http(paymasterRpcUrl),
+      });
+
+      const sessionKeyAccount = await deserializePermissionAccount(
+        publicClient,
+        entryPoint,
+        KERNEL_V3_1,
+        approval,
+        sessionKeySigner
+      );
+
       const kernelClient = createKernelAccountClient({
-        account,
-        chain: arbitrumBlueberry,
-        bundlerTransport: http(import.meta.env.VITE_BUNDLER_RPC),
+        account: sessionKeyAccount,
+        chain: b3,
+        bundlerTransport: http(bundlerRpcUrl),
+        paymaster: {
+          getPaymasterData(userOperation) {
+            return paymasterClient.sponsorUserOperation({ userOperation });
+          },
+        },
       });
       setKernelClient(kernelClient);
     };
@@ -80,9 +120,6 @@ function App() {
           data: "0x",
         },
       ]),
-      // Gelato-specific configurations
-      maxFeePerGas: BigInt(0),
-      maxPriorityFeePerGas: BigInt(0),
     });
     const _receipt = await kernelClient.waitForUserOperationReceipt({
       hash: userOpHash,
